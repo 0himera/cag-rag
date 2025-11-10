@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -24,6 +25,17 @@ load_dotenv()
 # Setup logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
+
+# Cache for query embeddings (LRU cache, max 100 entries)
+@lru_cache(maxsize=100)
+def cached_embed_text(query: str) -> Tuple[float, ...]:
+    """Cached version of embed_text. Returns tuple for hashability."""
+    logger.debug(f"Embedding query (cache miss): '{query[:50]}...'")
+    start_time = time.time()
+    vector = embed_text(query)
+    embed_time = time.time() - start_time
+    logger.debug(f"Embedding completed in {embed_time:.2f}s")
+    return tuple(vector)  # Convert to tuple for LRU cache
 
 
 # Pydantic models for API
@@ -140,17 +152,27 @@ def ingest_document_pdf(pdf_bytes: bytes, source: str) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 
-def perform_cag_check(query: str) -> Dict[str, Any]:
-    """Perform CAG check: Get detailed similarity analysis."""
-    query_vec = embed_text(query)
-    return cag_check(query_vec)
+def perform_cag_check(query: str) -> Tuple[Dict[str, Any], List[float]]:
+    """Perform CAG check and return detailed similarity analysis with query vector."""
+    logger.debug(f"CAG: Starting embedding for query: '{query[:50]}...'")
+    embed_start = time.time()
+    query_vec_tuple = cached_embed_text(query)
+    embed_time = time.time() - embed_start
+    query_vec = list(query_vec_tuple)  # Convert back to list
+    
+    cache_info = cached_embed_text.cache_info()
+    logger.debug(f"CAG: Embedding completed in {embed_time:.2f}s (cache hits: {cache_info.hits}, misses: {cache_info.misses})")
+    
+    cag_result = cag_check(query_vec)
+    return cag_result, query_vec
 
 
 def retrieve_and_rerank(query: str, query_vector: List[float] = None) -> Tuple[str, List[Dict[str, Any]]]:
     """Retrieve top_k, rerank, build context."""
     # Use provided query_vector or create new one
     if query_vector is None:
-        query_vec = embed_text(query)
+        query_vec_tuple = cached_embed_text(query)
+        query_vec = list(query_vec_tuple)  # Convert back to list
     else:
         query_vec = query_vector
         
@@ -299,7 +321,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
 
     logger.info(f"Processing query: '{q[:50]}...'")
     cag_start = time.time()
-    cag_result = perform_cag_check(q)
+    cag_result, query_vector = perform_cag_check(q)
     cag_time = time.time() - cag_start
     logger.info(f"CAG check completed in {cag_time:.2f}s")
     logger.info(f"CAG result: {cag_result}")
@@ -322,7 +344,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
             f"CAG passed, proceeding to RAG for query: '{q[:50]}...' (max_score: {cag_result['max_score']:.2f}, avg_score: {cag_result['avg_score']:.2f})"
         )
         # Perform RAG with cached query vector
-        result = handle_rag_query(q, query_vector=embed_text(q))
+        result = handle_rag_query(q, query_vector=query_vector)
         total_time = time.time() - start_time
         logger.info(
             f"Query processing completed: '{q[:50]}...', total time: {total_time:.2f}s"
