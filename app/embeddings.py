@@ -59,7 +59,7 @@ class JinaEmbeddingConfig:
         "JINA_EMBEDDING_ENDPOINT", "https://api.jina.ai/v1/embeddings"
     )
     timeout: int = int(os.getenv("JINA_EMBEDDING_TIMEOUT", "30"))
-    expected_dim: int = int(os.getenv("JINA_EMBEDDING_EXPECTED_DIM", "1024"))
+    expected_dim: int = int(os.getenv("JINA_EMBEDDING_EXPECTED_DIM", "2048"))
 
     def validate(self) -> None:
         if not self.api_key:
@@ -169,9 +169,10 @@ def _parse_embeddings_response(
     return embeddings
 
 
-def _encode_batch(texts: List[str]) -> List[List[float]]:
+def _encode_batch(texts: List[str], max_retries: int = 3) -> List[List[float]]:
     """
     Internal helper: send batch of texts to Jina embeddings API and return vectors.
+    Includes retry logic for transient failures.
     """
     if not texts:
         return []
@@ -181,22 +182,46 @@ def _encode_batch(texts: List[str]) -> List[List[float]]:
     payload = _build_payload(texts)
     headers = _build_headers()
 
-    try:
-        resp = requests.post(
-            _config.endpoint,
-            headers=headers,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            timeout=_config.timeout,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Failed to call Jina embeddings API: {exc}") from exc
-
-    if resp.status_code != 200:
-        # Try to include response body for easier debugging (without leaking secrets).
-        body_preview = resp.text[:500] if resp.text else ""
-        raise RuntimeError(
-            f"Jina embeddings API returned {resp.status_code}: {body_preview}"
-        )
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                _config.endpoint,
+                headers=headers,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                timeout=_config.timeout,
+            )
+            
+            if resp.status_code == 200:
+                break
+            elif resp.status_code in (429, 503):  # Rate limit or service unavailable
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    logger.warning(f"API rate limited, retrying in {wait_time}s...")
+                    import time
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    body_preview = resp.text[:500] if resp.text else ""
+                    raise RuntimeError(
+                        f"Jina embeddings API returned {resp.status_code} after retries: {body_preview}"
+                    )
+            else:
+                body_preview = resp.text[:500] if resp.text else ""
+                raise RuntimeError(
+                    f"Jina embeddings API returned {resp.status_code}: {body_preview}"
+                )
+        except requests.exceptions.Timeout as exc:
+            if attempt < max_retries - 1:
+                logger.warning(f"API timeout, retrying (attempt {attempt + 1}/{max_retries})...")
+                continue
+            else:
+                raise RuntimeError(f"Failed to call Jina embeddings API after {max_retries} retries: {exc}") from exc
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                logger.warning(f"API call failed, retrying (attempt {attempt + 1}/{max_retries})...")
+                continue
+            else:
+                raise RuntimeError(f"Failed to call Jina embeddings API: {exc}") from exc
 
     try:
         resp_json = resp.json()
