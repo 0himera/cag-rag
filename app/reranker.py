@@ -20,17 +20,17 @@ class JinaRerankerConfig:
       JINA_RERANKER_API_KEY
           API key for reranker (defaults to JINA_API_KEY if empty).
       JINA_RERANKER_MODEL
-          Model name, default: jina-reranker-v3-base-en
+          Model name, default: jina-reranker-v3
       JINA_RERANKER_ENDPOINT
           API endpoint, default: https://api.jina.ai/v1/rerank
-      JINA_RERANKER_TOP_K
-          Top k to return, default: 5
+      JINA_RERANKER_TOP_N
+          Top n to return, default: 5
     """
 
     api_key: str = os.getenv("JINA_RERANKER_API_KEY") or os.getenv("JINA_API_KEY", "")
-    model: str = os.getenv("JINA_RERANKER_MODEL", "jina-reranker-v3-base-en")
+    model: str = os.getenv("JINA_RERANKER_MODEL", "jina-reranker-v3")
     endpoint: str = os.getenv("JINA_RERANKER_ENDPOINT", "https://api.jina.ai/v1/rerank")
-    top_k: int = int(os.getenv("JINA_RERANKER_TOP_K", "5"))
+    top_n: int = int(os.getenv("JINA_RERANKER_TOP_N", "5"))
 
     def validate(self) -> None:
         if not self.api_key:
@@ -52,7 +52,7 @@ def _build_rerank_payload(query: str, documents: List[str]) -> Dict[str, Any]:
         "query": query,
         "documents": documents,
         "model": _config.model,
-        "top_k": _config.top_k,
+        "top_n": _config.top_n,
     }
 
 
@@ -74,12 +74,12 @@ def rerank_texts(query: str, texts: List[str], max_retries: int = 3) -> List[str
         max_retries: Maximum number of retry attempts.
 
     Returns:
-        List of top-k reranked texts, ordered by relevance.
+        List of top-n reranked texts, ordered by relevance.
     """
     if not texts:
         return []
     if not query:
-        return texts[: _config.top_k]
+        return texts[: _config.top_n]
 
     _config.validate()
 
@@ -132,7 +132,7 @@ def rerank_texts(query: str, texts: List[str], max_retries: int = 3) -> List[str
     if not isinstance(data["results"], list):
         raise RuntimeError("Invalid Jina reranker response: 'results' must be a list")
 
-    results = data["results"][: _config.top_k]
+    results = data["results"][: _config.top_n]
 
     # Extract the text from each result with proper validation
     reranked_texts = []
