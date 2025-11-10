@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
+from dotenv import load_dotenv
 from openai import OpenAI
 
 from .config import settings
-from dotenv import load_dotenv
+
 load_dotenv()
+
 
 def _get_client() -> OpenAI:
     """
