@@ -252,7 +252,7 @@ def cag_check(query_vector: Sequence[float]) -> Dict[str, Any]:
         
         # Multi-criteria decision making
         # Default threshold from config, but can be overridden
-        threshold = float(os.getenv("CAG_THRESHOLD", "0.5"))
+        threshold = float(os.getenv("CAG_THRESHOLD", "0.6"))
         
         # More sophisticated logic:
         # 1. Max score must exceed threshold
