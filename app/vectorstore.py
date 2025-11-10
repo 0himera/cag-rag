@@ -193,31 +193,100 @@ def delete_collection(collection_name: Optional[str] = None) -> None:
         pass
 
 
-def cag_check(query_vector: Sequence[float]) -> float:
+def cag_check(query_vector: Sequence[float]) -> Dict[str, Any]:
     """
-    Perform CAG (Context-Aware Gate) check: Get the maximum similarity score
-    between the query vector and any chunk in Qdrant.
-
-    This is a fast check to decide if RAG retrieval is needed.
+    Perform improved CAG (Context-Aware Gate) check with multiple metrics.
+    
+    Returns detailed information about the check:
+    - should_rag: bool - whether to proceed with RAG
+    - max_score: float - highest similarity score
+    - avg_score: float - average similarity of top results  
+    - num_results: int - number of results found
+    - reason: str - explanation of decision
     """
     if not query_vector:
-        return 0.0
+        return {
+            "should_rag": False,
+            "max_score": 0.0,
+            "avg_score": 0.0,
+            "num_results": 0,
+            "reason": "no_query_vector"
+        }
 
     cn = _config.collection_name
     client = get_qdrant_client()
-
+    
+    # Get top 3 results instead of just 1 for better analysis
     try:
         results = client.search(
             collection_name=cn,
             query_vector=list(query_vector),
-            limit=1,  # Only need the top score
+            limit=3,  # Get multiple results for analysis
             with_payload=False,
             with_vectors=False,
-            score_threshold=None,  # No threshold, get whatever is available
+            score_threshold=None,
         )
-        if results and results[0].score is not None:
-            return float(results[0].score)
-        return 0.0
-    except Exception:
-        # If collection doesn't exist or search fails, return 0.0 (no context found)
-        return 0.0
+        
+        if not results:
+            return {
+                "should_rag": False,
+                "max_score": 0.0,
+                "avg_score": 0.0,
+                "num_results": 0,
+                "reason": "no_results"
+            }
+        
+        scores = [float(r.score) for r in results if r.score is not None]
+        if not scores:
+            return {
+                "should_rag": False,
+                "max_score": 0.0,
+                "avg_score": 0.0,
+                "num_results": 0,
+                "reason": "no_valid_scores"
+            }
+        
+        max_score = max(scores)
+        avg_score = sum(scores) / len(scores)
+        num_results = len(scores)
+        
+        # Multi-criteria decision making
+        # Default threshold from config, but can be overridden
+        threshold = float(os.getenv("CAG_THRESHOLD", "0.5"))
+        
+        # More sophisticated logic:
+        # 1. Max score must exceed threshold
+        # 2. Average score should be reasonable (70% of threshold)
+        # 3. Need at least 2 results for confidence
+        should_rag = (
+            max_score > threshold and
+            avg_score > threshold * 0.7 and
+            num_results >= 2
+        )
+        
+        if should_rag:
+            reason = "passed_all_criteria"
+        elif max_score <= threshold:
+            reason = "max_score_below_threshold"
+        elif avg_score <= threshold * 0.7:
+            reason = "avg_score_too_low"
+        else:
+            reason = "insufficient_results"
+            
+        return {
+            "should_rag": should_rag,
+            "max_score": max_score,
+            "avg_score": avg_score,
+            "num_results": num_results,
+            "reason": reason
+        }
+        
+    except Exception as e:
+        # If collection doesn't exist or search fails, return safe defaults
+        return {
+            "should_rag": False,
+            "max_score": 0.0,
+            "avg_score": 0.0,
+            "num_results": 0,
+            "reason": f"search_error: {str(e)}"
+        }
