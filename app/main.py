@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 import os
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -9,6 +8,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import time
+import logging
 
 from .embeddings import embed_text
 from .generative_llm import generate_answer as generate_rag_answer
@@ -16,8 +17,13 @@ from .reranker import rerank_texts
 from .splitter import recursive_split
 from .vectorstore import cag_check, get_qdrant_client, upsert_chunks
 from .vectorstore import ensure_collection as ensure_qdrant_collection
+from .config import settings
 
 load_dotenv()
+
+# Setup logging
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger(__name__)
 
 
 # Pydantic models for API
@@ -43,26 +49,8 @@ class QueryResponse(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Settings (simplified, assume from config or inline)
+# Using centralized config from app.config
 # -----------------------------------------------------------------------------
-
-
-class Settings:
-    qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
-    qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "documents")
-    cag_threshold: float = float(os.getenv("CAG_THRESHOLD", "0.5"))
-    retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "10"))
-    reranked_top_k: int = int(os.getenv("RERANKED_TOP_K", "5"))
-    max_context_chars: int = int(os.getenv("MAX_CONTEXT_CHARS", "4000"))
-    chunk_size_tokens: int = int(os.getenv("CHUNK_SIZE_TOKENS", "500"))
-    chunk_overlap_tokens: int = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
-    static_response_message: str = os.getenv(
-        "STATIC_RESPONSE_MESSAGE",
-        "На основе имеющейся у меня базы знаний, я не могу предоставить ответ на ваш вопрос.",
-    )
-
-
-settings = Settings()
 
 # -----------------------------------------------------------------------------
 # Utility functions
@@ -152,15 +140,20 @@ def ingest_document_pdf(pdf_bytes: bytes, source: str) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 
-def perform_cag_check(query: str) -> float:
-    """Perform CAG check: Get max similarity score."""
+def perform_cag_check(query: str) -> Dict[str, Any]:
+    """Perform CAG check: Get detailed similarity analysis."""
     query_vec = embed_text(query)
     return cag_check(query_vec)
 
 
-def retrieve_and_rerank(query: str) -> Tuple[str, List[Dict[str, Any]]]:
+def retrieve_and_rerank(query: str, query_vector: List[float] = None) -> Tuple[str, List[Dict[str, Any]]]:
     """Retrieve top_k, rerank, build context."""
-    query_vec = embed_text(query)
+    # Use provided query_vector or create new one
+    if query_vector is None:
+        query_vec = embed_text(query)
+    else:
+        query_vec = query_vector
+        
     client = get_qdrant_client()
     # Retrieve more initially for reranking
     results = client.search(
@@ -190,10 +183,14 @@ def retrieve_and_rerank(query: str) -> Tuple[str, List[Dict[str, Any]]]:
     if len(retrieved_texts) > settings.reranked_top_k:
         reranked_texts = rerank_texts(query, retrieved_texts)
         reranked_texts = reranked_texts[: settings.reranked_top_k]
-        # Filter metadata to match reranked
-        reranked_metadata = [
-            m for m in retrieved_metadata if m["text"].strip() in reranked_texts
-        ]
+        # Filter metadata to match reranked texts using proper mapping
+        reranked_metadata = []
+        for reranked_text in reranked_texts:
+            # Find matching metadata by text content
+            for metadata in retrieved_metadata:
+                if metadata["text"].strip() == reranked_text.strip():
+                    reranked_metadata.append(metadata)
+                    break
     else:
         reranked_texts = retrieved_texts[: settings.reranked_top_k]
         reranked_metadata = retrieved_metadata[: settings.reranked_top_k]
@@ -204,18 +201,44 @@ def retrieve_and_rerank(query: str) -> Tuple[str, List[Dict[str, Any]]]:
     return context, reranked_metadata
 
 
-def handle_rag_query(query: str) -> Dict[str, Any]:
+def handle_rag_query(query: str, query_vector: List[float] = None) -> Dict[str, Any]:
     """Handle full RAG query."""
-    context, retrieved_contexts = retrieve_and_rerank(query)
+    start_time = time.time()
+    logger.info(f"Starting RAG for query: '{query[:50]}...'")
+    retrieval_start = time.time()
+    context, retrieved_contexts = retrieve_and_rerank(query, query_vector)
+    retrieval_time = time.time() - retrieval_start
+    logger.info(f"Retrieval completed in {retrieval_time:.2f}s")
     if not context.strip():
+        logger.warning(f"No context retrieved for query: '{query[:50]}...'")
         return {
             "answer": settings.static_response_message,
             "answerable": False,
             "retrieved_contexts": [],
         }
+    generation_start = time.time()
     answer = generate_rag_answer(query, context)
-    # For simplicity, assume answerable if answer is generated (LLM follows instructions)
-    answerable = not (answer.startswith("Я не могу") or "не могу" in answer.lower())
+    generation_time = time.time() - generation_start
+    logger.info(f"Generation completed in {generation_time:.2f}s")
+    # Use answerability classifier instead of keyword matching
+    try:
+        from .answerability import classify_answerability
+        classification = classify_answerability(
+            question=query,
+            candidate_answer=answer,
+            qa_score=0.8,  # Default confidence score
+            contexts=retrieved_contexts
+        )
+        answerable = classification["answerable"]
+        answer = classification["final_answer"]
+    except Exception as e:
+        # Fallback to simple keyword matching if classifier fails
+        logger.warning(f"Answerability classifier failed: {e}, using fallback")
+        answerable = not (answer.startswith("Я не могу") or "не могу" in answer.lower())
+    total_time = time.time() - start_time
+    logger.info(
+        f"RAG completed for query: '{query[:50]}...', total time: {total_time:.2f}s"
+    )
     return {
         "answer": answer,
         "answerable": answerable,
@@ -269,26 +292,44 @@ async def ingest_pdf(file: UploadFile = File(...)) -> IngestResponse:
 # Query endpoint
 @app.post("/query")
 async def query_endpoint(req: QueryRequest) -> QueryResponse:
+    start_time = time.time()
     q = (req.query or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="Query required")
 
-    max_similarity = perform_cag_check(q)
-
-    if max_similarity <= settings.cag_threshold:
+    logger.info(f"Processing query: '{q[:50]}...'")
+    cag_start = time.time()
+    cag_result = perform_cag_check(q)
+    cag_time = time.time() - cag_start
+    logger.info(f"CAG check completed in {cag_time:.2f}s")
+    logger.info(f"CAG result: {cag_result}")
+    
+    if not cag_result["should_rag"]:
+        logger.info(
+            f"CAG triggered static response for query: '{q[:50]}...' (reason: {cag_result['reason']}, score: {cag_result['max_score']:.2f})"
+        )
+        total_time = time.time() - start_time
+        logger.info(f"Total processing time: {total_time:.2f}s")
         # No RAG needed
         return QueryResponse(
             answer=settings.static_response_message,
             answerable=False,
-            cag_max_score=max_similarity,
+            cag_max_score=cag_result["max_score"],
             retrieved_contexts=[],
         )
     else:
-        # Perform RAG
-        result = handle_rag_query(q)
+        logger.info(
+            f"CAG passed, proceeding to RAG for query: '{q[:50]}...' (max_score: {cag_result['max_score']:.2f}, avg_score: {cag_result['avg_score']:.2f})"
+        )
+        # Perform RAG with cached query vector
+        result = handle_rag_query(q, query_vector=embed_text(q))
+        total_time = time.time() - start_time
+        logger.info(
+            f"Query processing completed: '{q[:50]}...', total time: {total_time:.2f}s"
+        )
         return QueryResponse(
             answer=result["answer"],
             answerable=result["answerable"],
-            cag_max_score=max_similarity,
+            cag_max_score=cag_result["max_score"],
             retrieved_contexts=result["retrieved_contexts"],
         )
